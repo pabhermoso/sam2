@@ -20,6 +20,7 @@ from data.store import set_videos
 from flask import Flask, make_response, Request, request, Response, send_from_directory
 from flask_cors import CORS
 from inference.data_types import PropagateDataResponse, PropagateInVideoRequest
+from inference.image_segmentor import ImageSegmentor
 from inference.multipart import MultipartResponseBuilder
 from inference.predictor import InferenceAPI
 from strawberry.flask.views import GraphQLView
@@ -33,6 +34,7 @@ videos = preload_data()
 set_videos(videos)
 
 inference_api = InferenceAPI()
+image_segmentor = ImageSegmentor()
 
 
 @app.route("/healthy")
@@ -85,6 +87,67 @@ def propagate_in_video() -> Response:
     boundary = "frame"
     frame = gen_track_with_mask_stream(boundary, **args)
     return Response(frame, mimetype="multipart/x-savi-stream; boundary=" + boundary)
+
+
+@app.route("/segment_image", methods=["POST"])
+def segment_image() -> Response:
+    """
+    Segment a single image using click prompts.
+    Body: {
+      "image": "<base64 or data URL>",
+      "points": [{ "x": float, "y": float, "label": 1|0 }, ...]  # 1=fg, 0=bg
+      # legacy: "point": { "x": float, "y": float }
+    }
+    """
+    data = request.json or {}
+    image_b64 = data.get("image")
+    points = data.get("points")
+    if points is None and data.get("point"):
+        # Backward compatibility with single point payload
+        pt = data.get("point")
+        points = [{"x": pt.get("x"), "y": pt.get("y"), "label": 1}]
+    if points is None:
+        points = []
+    if not image_b64 or not isinstance(points, list) or len(points) == 0:
+        return make_response({"error": "image and point(s) are required"}, 400)
+
+    try:
+        coords = []
+        labels = []
+        for pt in points:
+            if not isinstance(pt, dict):
+                continue
+            if "x" in pt and "y" in pt and "label" in pt:
+                coords.append((float(pt["x"]), float(pt["y"])))
+                labels.append(int(pt["label"]))
+            elif "x" in pt and "y" in pt:
+                coords.append((float(pt["x"]), float(pt["y"])))
+                labels.append(1)
+
+        if len(coords) == 0:
+            return make_response({"error": "no valid points provided"}, 400)
+
+        png_b64, bbox = image_segmentor.segment(
+            image_b64=image_b64,
+            points=tuple(coords),
+            labels=tuple(labels),
+            pad=10,
+        )
+        return make_response(
+            {
+                "png_base64": png_b64,
+                "bbox": {
+                    "min_x": bbox[0],
+                    "min_y": bbox[1],
+                    "max_x": bbox[2],
+                    "max_y": bbox[3],
+                },
+            },
+            200,
+        )
+    except Exception as exc:
+        logger.exception("segment_image failed")
+        return make_response({"error": str(exc)}, 500)
 
 
 def gen_track_with_mask_stream(
