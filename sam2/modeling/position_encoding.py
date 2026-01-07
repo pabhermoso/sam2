@@ -43,12 +43,19 @@ class PositionEmbeddingSine(nn.Module):
         self.scale = scale
 
         self.cache = {}
-        if warmup_cache and torch.cuda.is_available():
-            # Warmup cache for cuda, to help with compilation
-            device = torch.device("cuda")
-            for stride in strides:
-                cache_key = (image_size // stride, image_size // stride)
-                self._pe(1, device, *cache_key)
+        # Warmup cache for GPU devices (CUDA or MPS) to help with compilation
+        if warmup_cache:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = None
+            
+            if device is not None:
+                for stride in strides:
+                    cache_key = (image_size // stride, image_size // stride)
+                    self._pe(1, device, *cache_key)
 
     def _encode_xy(self, x, y):
         # The positions are expected to be normalized
@@ -229,10 +236,12 @@ def apply_rotary_enc(
     # repeat freqs along seq_len dim to match k seq_len
     if repeat_freqs_k:
         r = xk_.shape[-2] // xq_.shape[-2]
-        if freqs_cis.is_cuda:
+        # Use repeat on CUDA and MPS, expand+flatten for CPU (torch.repeat on complex
+        # numbers may not be fully supported on all CPU configurations)
+        if freqs_cis.is_cuda or (hasattr(freqs_cis, 'is_mps') and freqs_cis.is_mps) or str(freqs_cis.device).startswith('mps'):
             freqs_cis = freqs_cis.repeat(*([1] * (freqs_cis.ndim - 2)), r, 1)
         else:
-            # torch.repeat on complex numbers may not be supported on non-CUDA devices
+            # torch.repeat on complex numbers may not be supported on non-GPU devices
             # (freqs_cis has 4 dims and we repeat on dim 2) so we use expand + flatten
             freqs_cis = freqs_cis.unsqueeze(2).expand(-1, -1, r, -1, -1).flatten(2, 3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)

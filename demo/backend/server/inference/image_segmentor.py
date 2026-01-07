@@ -45,9 +45,39 @@ class ImageSegmentor:
         force_cpu_device = os.environ.get("SAM2_DEMO_FORCE_CPU_DEVICE", "0") == "1"
         if force_cpu_device:
             logger.info("forcing CPU device for SAM 2 demo (image)")
+        
+        # Detect if running in a forked process (e.g., gunicorn worker)
+        # MPS (Metal) doesn't work correctly in forked processes on macOS
+        # because the Metal compiler service crashes in forked children
+        is_forked_process = False
+        if torch.backends.mps.is_available() and not force_cpu_device:
+            # Multiple ways to detect gunicorn/forked workers:
+            if "gunicorn" in os.environ.get("SERVER_SOFTWARE", "").lower():
+                is_forked_process = True
+            try:
+                import sys
+                if any('gunicorn' in arg.lower() for arg in sys.argv):
+                    is_forked_process = True
+                main_module = sys.modules.get('__main__', None)
+                if main_module:
+                    main_spec = getattr(main_module, '__spec__', None)
+                    if main_spec and main_spec.name and 'gunicorn' in main_spec.name.lower():
+                        is_forked_process = True
+                    main_file = getattr(main_module, '__file__', '') or ''
+                    if 'gunicorn' in main_file.lower():
+                        is_forked_process = True
+            except Exception:
+                pass
+            
+            if is_forked_process:
+                logger.warning(
+                    "Detected gunicorn worker. MPS doesn't work in forked processes. "
+                    "Falling back to CPU."
+                )
+        
         if torch.cuda.is_available() and not force_cpu_device:
             device = torch.device("cuda")
-        elif torch.backends.mps.is_available() and not force_cpu_device:
+        elif torch.backends.mps.is_available() and not force_cpu_device and not is_forked_process:
             device = torch.device("mps")
         else:
             device = torch.device("cpu")
@@ -72,6 +102,9 @@ class ImageSegmentor:
     def autocast_context(self):
         if self.device.type == "cuda":
             return torch.autocast("cuda", dtype=torch.bfloat16)
+        elif self.device.type == "mps":
+            # MPS supports float16 autocast (bfloat16 not fully supported on MPS)
+            return torch.autocast("mps", dtype=torch.float16)
         return contextlib.nullcontext()
 
     def segment(self, image_b64: str, points: Tuple[Tuple[float, float], ...], labels: Tuple[int, ...], pad: int = 0):

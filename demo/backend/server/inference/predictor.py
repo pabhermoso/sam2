@@ -65,9 +65,43 @@ class InferenceAPI:
         force_cpu_device = os.environ.get("SAM2_DEMO_FORCE_CPU_DEVICE", "0") == "1"
         if force_cpu_device:
             logger.info("forcing CPU device for SAM 2 demo")
+        
+        # Detect if running in a forked process (e.g., gunicorn worker)
+        # MPS (Metal) doesn't work correctly in forked processes on macOS
+        # because the Metal compiler service crashes in forked children
+        is_forked_process = False
+        if torch.backends.mps.is_available() and not force_cpu_device:
+            # Multiple ways to detect gunicorn/forked workers:
+            # 1. Check SERVER_SOFTWARE env var
+            if "gunicorn" in os.environ.get("SERVER_SOFTWARE", "").lower():
+                is_forked_process = True
+            # 2. Check sys.argv for gunicorn
+            try:
+                import sys
+                if any('gunicorn' in arg.lower() for arg in sys.argv):
+                    is_forked_process = True
+                # 3. Check __main__ module
+                main_module = sys.modules.get('__main__', None)
+                if main_module:
+                    main_spec = getattr(main_module, '__spec__', None)
+                    if main_spec and main_spec.name and 'gunicorn' in main_spec.name.lower():
+                        is_forked_process = True
+                    main_file = getattr(main_module, '__file__', '') or ''
+                    if 'gunicorn' in main_file.lower():
+                        is_forked_process = True
+            except Exception:
+                pass
+            
+            if is_forked_process:
+                logger.warning(
+                    "Detected gunicorn worker process. "
+                    "MPS (Metal) doesn't work correctly in forked processes on macOS. "
+                    "Falling back to CPU. To use MPS, run the server directly without gunicorn."
+                )
+        
         if torch.cuda.is_available() and not force_cpu_device:
             device = torch.device("cuda")
-        elif torch.backends.mps.is_available() and not force_cpu_device:
+        elif torch.backends.mps.is_available() and not force_cpu_device and not is_forked_process:
             device = torch.device("mps")
         else:
             device = torch.device("cpu")
@@ -94,6 +128,9 @@ class InferenceAPI:
     def autocast_context(self):
         if self.device.type == "cuda":
             return torch.autocast("cuda", dtype=torch.bfloat16)
+        elif self.device.type == "mps":
+            # MPS supports float16 autocast (bfloat16 not fully supported on MPS)
+            return torch.autocast("mps", dtype=torch.float16)
         else:
             return contextlib.nullcontext()
 
@@ -404,13 +441,24 @@ class InferenceAPI:
             f"{len(session['state']['obj_ids'])} objects)"
             for session_id, session in self.session_states.items()
         ]
+        
+        # Get GPU memory stats based on device type
+        if self.device.type == "cuda":
+            gpu_mem_str = (
+                f"GPU memory: "
+                f"{torch.cuda.memory_allocated() // 1024**2} MiB used and "
+                f"{torch.cuda.memory_reserved() // 1024**2} MiB reserved"
+                f" (max over time: {torch.cuda.max_memory_allocated() // 1024**2} MiB used "
+                f"and {torch.cuda.max_memory_reserved() // 1024**2} MiB reserved)"
+            )
+        elif self.device.type == "mps":
+            # MPS has limited memory introspection
+            gpu_mem_str = "MPS device (memory stats not available)"
+        else:
+            gpu_mem_str = "CPU device"
+        
         session_stats_str = (
-            "Test String Here - -"
-            f"live sessions: [{', '.join(live_session_strs)}], GPU memory: "
-            f"{torch.cuda.memory_allocated() // 1024**2} MiB used and "
-            f"{torch.cuda.memory_reserved() // 1024**2} MiB reserved"
-            f" (max over time: {torch.cuda.max_memory_allocated() // 1024**2} MiB used "
-            f"and {torch.cuda.max_memory_reserved() // 1024**2} MiB reserved)"
+            f"live sessions: [{', '.join(live_session_strs)}], {gpu_mem_str}"
         )
         return session_stats_str
 

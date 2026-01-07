@@ -267,9 +267,13 @@ class RoPEAttention(Attention):
             compute_axial_cis, dim=self.internal_dim // self.num_heads, theta=rope_theta
         )
         freqs_cis = self.compute_cis(end_x=feat_sizes[0], end_y=feat_sizes[1])
-        self.freqs_cis = (
-            freqs_cis.to("cuda") if torch.cuda.is_available() else freqs_cis
-        )
+        # Support CUDA, MPS, or CPU devices
+        if torch.cuda.is_available():
+            self.freqs_cis = freqs_cis.to("cuda")
+        elif torch.backends.mps.is_available():
+            self.freqs_cis = freqs_cis.to("mps")
+        else:
+            self.freqs_cis = freqs_cis
         self.rope_k_repeat = rope_k_repeat
 
     def forward(
